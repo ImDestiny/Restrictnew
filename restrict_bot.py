@@ -645,20 +645,39 @@ async def broadcast(bot, message):
 # ==============================================================================
 
 # 1. DIRECT LINK HANDLER (Private & Group)
-@app.on_message((filters.text | filters.caption) & (filters.private | filters.group) & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status"]))
+# FIX 1: Added & ~filters.forwarded to immediately ignore "Leech Started" forwards
+@app.on_message((filters.text | filters.caption) & (filters.private | filters.group) & ~filters.forwarded & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status"]))
 async def save(client: Client, message: Message):
     # --- SAFETY CHECK: Ignore messages from Channels/Anonymous Admins ---
     if not message.from_user:
         return 
+    
     user_id = message.from_user.id
-    # Check if user is already in a setup flow
+    
+    # --- PENDING TASK HANDLER (Waiting for ID or Speed) ---
     if user_id in PENDING_TASKS:
-        if PENDING_TASKS[user_id].get("status") == "waiting_id":
-            await process_custom_destination(client, message)
-            return
-        if PENDING_TASKS[user_id].get("status") == "waiting_speed":
-            await process_speed_input(client, message)
-            return
+        should_process = True
+        
+        # FIX 2: Group Guard
+        # If in a group, ONLY accept input if it is a REPLY to the bot.
+        if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+            # Must be a reply
+            if not message.reply_to_message:
+                should_process = False
+            # Must be a reply to THIS bot
+            elif not (message.reply_to_message.from_user and message.reply_to_message.from_user.is_self):
+                should_process = False
+
+        if should_process:
+            if PENDING_TASKS[user_id].get("status") == "waiting_id":
+                await process_custom_destination(client, message)
+                return
+            if PENDING_TASKS[user_id].get("status") == "waiting_speed":
+                await process_speed_input(client, message)
+                return
+        
+        # If should_process is False (e.g., random chat msg), we fall through.
+        # This allows checking if it's a NEW link, otherwise we ignore it.
 
     link_text = message.text or message.caption
     if not link_text or "https://t.me/" not in link_text:
