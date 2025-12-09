@@ -647,8 +647,10 @@ async def broadcast(bot, message):
 # 1. DIRECT LINK HANDLER (Private & Group)
 @app.on_message((filters.text | filters.caption) & (filters.private | filters.group) & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status"]))
 async def save(client: Client, message: Message):
+    # --- SAFETY CHECK: Ignore messages from Channels/Anonymous Admins ---
+    if not message.from_user:
+        return 
     user_id = message.from_user.id
-    
     # Check if user is already in a setup flow
     if user_id in PENDING_TASKS:
         if PENDING_TASKS[user_id].get("status") == "waiting_id":
