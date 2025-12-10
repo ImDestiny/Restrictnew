@@ -10,7 +10,7 @@ import datetime # Added for timedelta in stats
 from pathlib import Path
 from collections import defaultdict
 import motor.motor_asyncio
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import (
     FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant, 
     InviteHashExpired, UsernameNotOccupied, FileReferenceExpired, UserNotParticipant,
