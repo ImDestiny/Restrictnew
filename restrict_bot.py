@@ -39,7 +39,7 @@ WAITING_TIME = int(os.environ.get("WAITING_TIME", 3))
 admin_str = os.environ.get("ADMINS", "")
 ADMINS = [int(x) for x in admin_str.split(",") if x.strip().isdigit()]
 
-sudo_str = os.environ.get("SUDOS", "486433780")
+sudo_str = os.environ.get("SUDOS", "")
 SUDOS = [int(x) for x in sudo_str.split(",") if x.strip().isdigit()]
 
 HELP_TXT = """**📚 BOT'S HELP MENU**
