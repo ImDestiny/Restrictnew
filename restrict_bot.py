@@ -12,6 +12,11 @@ import uuid
 from pathlib import Path
 from collections import defaultdict
 import motor.motor_asyncio
+# --- NEW IMPORTS ---
+import yt_dlp
+import aria2p
+from mega import Mega
+# -------------------
 from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import (
     FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant,
@@ -31,6 +36,44 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_URI = os.environ.get("DB_URI", "")
 DB_NAME = os.environ.get("DB_NAME", "")
 STRING_SESSION = os.environ.get("STRING_SESSION", None)
+
+# --- NEW CONFIGURATIONS ---
+MEGA_EMAIL = os.environ.get("MEGA_EMAIL", None)
+MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD", None)
+
+# Initialize Aria2
+try:
+    aria2 = aria2p.API(
+        aria2p.Client(
+            host="http://localhost",
+            port=6800,
+            secret=""
+        )
+    )
+except:
+    print("⚠️ Aria2 RPC not found. Make sure to run: aria2c --enable-rpc --rpc-listen-all=false --daemon")
+    aria2 = None
+
+# Initialize Mega
+mega = Mega()
+m_login = None
+try:
+    if MEGA_EMAIL and MEGA_PASSWORD:
+        m_login = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
+    else:
+        m_login = mega.login()
+except Exception as e:
+    print(f"Mega Login Error: {e}")
+
+EXTERNAL_QUEUE = {} # Stores temporary menu data for external links
+# --------------------------
+
+# Error Log Channel (Optional)
+# Usage: "-100xxxx" for channel, or "-100xxxx/5" for Group Topic
+LOG_CHANNEL = os.environ.get("LOG_CHANNEL", "") 
+
+# Queue System
+TASK_QUEUE = defaultdict(list) # Stores pending tasks: user_id -> [task_data, ...]
 
 LOGIN_SYSTEM = os.environ.get("LOGIN_SYSTEM", "True").lower() == "true"
 ERROR_MESSAGE = os.environ.get("ERROR_MESSAGE", "True").lower() == "true"
@@ -135,6 +178,26 @@ class Database:
     async def total_session_users_count(self):
         count = await self.col.count_documents({"session": {"$ne": None}})
         return count
+
+    # --- NEW COOKIE METHODS ---
+    async def save_cookies(self, cookie_text):
+        await self.db.settings.update_one(
+            {'_id': 'cookies'}, 
+            {'$set': {'data': cookie_text}}, 
+            upsert=True
+        )
+
+    async def get_cookies(self, path="cookies.txt"):
+        data = await self.db.settings.find_one({'_id': 'cookies'})
+        if data:
+            with open(path, 'w') as f:
+                f.write(data['data'])
+            return path
+        return None
+
+    async def remove_cookies(self):
+        await self.db.settings.delete_one({'_id': 'cookies'})
+    # --------------------------
 
 db = Database(DB_URI, DB_NAME)
 
@@ -368,7 +431,7 @@ async def upstatus(client: Client, status_message: Message, chat, index: int, to
         await client.edit_message_text(chat, msg_id, f"✅ **Upload Complete** ({index}/{total_count})")
     except:
         pass
-
+        
 def get_message_type(msg: Message):
     if msg.document: return "Document"
     if msg.video: return "Video"
@@ -551,6 +614,28 @@ async def bot_stats_handler(client: Client, message: Message):
         f"**Logged-in Users:** `{session_users}` (Users with a saved session)"
     )
 
+# ==============================================================================
+# --- COOKIE MANAGEMENT ---
+# ==============================================================================
+
+@app.on_message(filters.command(["addcookie"]) & filters.user(ADMINS))
+async def add_cookie_handler(client, message):
+    if not message.reply_to_message or not message.reply_to_message.document:
+        return await message.reply("❌ Reply to a `cookies.txt` file.")
+    
+    path = await message.reply_to_message.download("cookies_temp.txt")
+    with open(path, 'r') as f:
+        content = f.read()
+    
+    await db.save_cookies(content)
+    os.remove(path)
+    await message.reply("✅ **Cookies Saved!** They will be used for YouTube/GDrive.")
+
+@app.on_message(filters.command(["removecookie"]) & filters.user(ADMINS))
+async def remove_cookie_handler(client, message):
+    await db.remove_cookies()
+    await message.reply("🗑️ **Cookies Deleted.**")
+    
 # ==============================================================================
 # --- LOGIN / LOGOUT (async login handler inserted) ---
 # ==============================================================================
@@ -806,9 +891,11 @@ async def broadcast(bot, message):
 # --- CORE: receive links / start tasks / processing / cancel checks ---
 # ==============================================================================
 
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status", "addcookie", "removecookie"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
+    
+    # 1. HANDLE PENDING SETUP (Speed/Dest)
     if user_id in PENDING_TASKS:
         if PENDING_TASKS[user_id].get("status") == "waiting_id":
             await process_custom_destination(client, message)
@@ -817,23 +904,40 @@ async def save(client: Client, message: Message):
             await process_speed_input(client, message)
             return
 
-    link_text = message.text or message.caption
-    if not link_text or "https://t.me/" not in link_text:
+    text = message.text or message.caption
+    if not text: return
+
+    # 2. TELEGRAM LINKS (Standard Logic)
+    if "t.me/" in text or "telegram.me/" in text:
+        if "https://t.me/" not in text: return
+        
+        PENDING_TASKS[user_id] = {"link": text, "status": "waiting_choice"}
+        buttons = [
+            [InlineKeyboardButton("📂 Send to DM (Here)", callback_data="dest_dm")],
+            [InlineKeyboardButton("📢 Send to Channel/Group", callback_data="dest_custom")],
+            [InlineKeyboardButton("❌ Cancel Setup", callback_data="cancel_setup")]
+        ]
+        await message.reply(
+            "✨ **Telegram Link Detected!**\nWhere to send?", 
+            reply_markup=InlineKeyboardMarkup(buttons), 
+            quote=True
+        )
         return
 
-    PENDING_TASKS[user_id] = {"link": link_text, "status": "waiting_choice"}
-    buttons = [
-        [InlineKeyboardButton("📂 Send to DM (Here)", callback_data="dest_dm")],
-        [InlineKeyboardButton("📢 Send to Channel/Group", callback_data="dest_custom")],
-        [InlineKeyboardButton("❌ Cancel Setup", callback_data="cancel_setup")]
-    ]
-    await message.reply(
-        "✨ **Link Detected!**\n\n"
-        "I am ready to process this content. Please tell me where you want the files sent:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        quote=True
-    )
-    
+    # 3. MEGA.NZ LINKS
+    if "mega.nz" in text:
+        await handle_mega_link(client, message, text)
+        return
+
+    # 4. TORRENT / MAGNET
+    if text.startswith("magnet:") or text.endswith(".torrent"):
+        await handle_torrent_link(client, message, text)
+        return
+
+    # 5. GENERAL EXTERNAL (YT / Drive / Direct)
+    if text.startswith("http"):
+        await handle_general_link(client, message, text)
+            
 @app.on_message(filters.command(["dl"]) & (filters.private | filters.group))
 async def dl_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -982,35 +1086,104 @@ async def process_speed_input(client: Client, message: Message):
     else:
         await message.reply("❌ Task expired.")
 
-async def start_task_final(client: Client, message_context: Message, task_data: dict, delay: int, user_id: int):
-    # FIX 1: Check Limit Here
-    if user_id not in ADMINS and batch_temp.ACTIVE_TASKS[user_id] >= MAX_CONCURRENT_TASKS_PER_USER:
+# ==============================================================================
+# --- NEW ROBUSTNESS HELPERS ---
+# ==============================================================================
+
+async def send_log(text):
+    """Sends errors/alerts to the Configured Log Channel/Topic"""
+    if not LOG_CHANNEL:
+        return
+    try:
+        chat_id = LOG_CHANNEL
+        topic_id = None
+        
+        # Check if "ID/TOPIC" format
+        if "/" in LOG_CHANNEL:
+            parts = LOG_CHANNEL.split("/")
+            chat_id = int(parts[0])
+            topic_id = int(parts[1])
+        else:
+            chat_id = int(LOG_CHANNEL)
+
+        await app.send_message(chat_id, text, message_thread_id=topic_id)
+    except Exception as e:
+        print(f"❌ Failed to send log: {e}")
+
+async def check_disk_space():
+    """Returns False if free space is < 500MB"""
+    try:
+        total, used, free = shutil.disk_usage(".")
+        free_mb = free / (1024 * 1024)
+        if free_mb < 500: # Limit: 500MB
+            return False
+        return True
+    except:
+        return True
+
+async def cleanup_watchdog():
+    """Runs every 10 mins to clean stuck download folders older than 2 hours"""
+    while True:
+        await asyncio.sleep(600) # Check every 10 mins
         try:
-            msg = f"⚠️ **Limit Reached:** You have {batch_temp.ACTIVE_TASKS[user_id]} active tasks. Please wait."
-            if isinstance(message_context, Message):
-                if message_context.from_user.is_bot:
-                    await message_context.edit(msg)
-                else:
-                    await message_context.reply(msg)
-        except:
-            pass
+            download_path = Path("./downloads")
+            if not download_path.exists(): continue
+            
+            current_time = time.time()
+            # 2 hours in seconds
+            max_age = 2 * 60 * 60 
+            
+            for user_folder in download_path.iterdir():
+                if user_folder.is_dir():
+                    for task_folder in user_folder.iterdir():
+                        if task_folder.is_dir():
+                            folder_time = task_folder.stat().st_mtime
+                            if (current_time - folder_time) > max_age:
+                                shutil.rmtree(task_folder)
+                                await send_log(f"🧹 **Auto-Cleanup:** Deleted stuck folder `{task_folder.name}` (Older than 2h)")
+        except Exception as e:
+            print(f"Watchdog Error: {e}")
+            
+async def start_task_final(client: Client, message_context: Message, task_data: dict, delay: int, user_id: int):
+    # 1. DISK SPACE PRE-CHECK
+    if not await check_disk_space():
+        msg = "⚠️ **Server Busy:** Disk is almost full. Please wait for other tasks to finish."
+        if isinstance(message_context, Message):
+             await message_context.reply(msg, quote=True)
+        await send_log("🚨 **Critical:** Disk Space Low (<500MB). Tasks rejected.")
         return
 
+    # 2. QUEUE SYSTEM
+    # If user has hit their limit (e.g., 2 tasks), queue this one.
+    if user_id not in ADMINS and batch_temp.ACTIVE_TASKS[user_id] >= MAX_CONCURRENT_TASKS_PER_USER:
+        TASK_QUEUE[user_id].append({
+            "client": client,
+            "message": message_context,
+            "data": task_data,
+            "delay": delay
+        })
+        position = len(TASK_QUEUE[user_id])
+        await message_context.reply(f"⏳ **Added to Queue:** Position #{position}\nTask will start automatically when your current tasks finish.", quote=True)
+        return
+
+    # 3. START TASK (Standard Logic)
     task_uuid = uuid.uuid4().hex
     dest = task_data.get("dest_title", "Direct Message")
     
-    # FIX 2: Increment Counter Here (Only Once)
     batch_temp.ACTIVE_TASKS[user_id] += 1
     batch_temp.IS_BATCH[user_id] = False
 
+    start_msg = f"✅ **Task Started!**\nDestination: `{dest}`\nSpeed: `{delay}s` delay\nTask ID: `{task_uuid[:8]}`"
     try:
         if isinstance(message_context, Message):
             if message_context.from_user.is_bot:
-                await message_context.edit(f"✅ **Task Started!**\nDestination: `{dest}`\nSpeed: `{delay}s` delay\nTask ID: `{task_uuid[:8]}`")
+                await message_context.edit(start_msg)
             else:
-                await message_context.reply(f"✅ **Task Started!**\nDestination: `{dest}`\nSpeed: `{delay}s` delay\nTask ID: `{task_uuid[:8]}`")
-    except:
-        pass
+                await message_context.reply(start_msg)
+    except: pass
+    
+    # Log to Channel
+    await send_log(f"▶️ **Task Started**\nUser: `{user_id}`\nLink: `{task_data['link'][:40]}...`")
 
     if user_id not in ACTIVE_PROCESSES:
         ACTIVE_PROCESSES[user_id] = {}
@@ -1020,19 +1193,33 @@ async def start_task_final(client: Client, message_context: Message, task_data: 
         "started": time.time()
     }
 
-    asyncio.create_task(
-        process_links_logic(
-            client,
-            message_context,
-            task_data["link"],
-            dest_chat_id=task_data.get("dest_chat_id"),
-            dest_thread_id=task_data.get("dest_thread_id"),
-            delay=delay,
-            acc_user_id=user_id,
-            task_uuid=task_uuid
+    # --- LOGIC SWITCHER ---
+    if task_data.get("type") in ["external", "mega", "mega_file", "torrent", "playlist_all"]:
+        # Launch the Universal Downloader
+        asyncio.create_task(
+            process_external_logic(
+                client, message_context, 
+                task_data,
+                delay=delay,
+                user_id=user_id, 
+                task_uuid=task_uuid
+            )
         )
-    )
-    
+    else:
+        # Launch Standard Telegram Processing
+        asyncio.create_task(
+            process_links_logic(
+                client,
+                message_context,
+                task_data["link"],
+                dest_chat_id=task_data.get("dest_chat_id"),
+                dest_thread_id=task_data.get("dest_thread_id"),
+                delay=delay,
+                acc_user_id=user_id,
+                task_uuid=task_uuid
+            )
+        )
+        
 async def process_links_logic(client: Client, message: Message, text: str, dest_chat_id=None, dest_thread_id=None, delay=3, acc_user_id=None, task_uuid=None):
     if acc_user_id:
         user_id = acc_user_id
@@ -1343,29 +1530,49 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                         print(f"Error updating status: {e}")
                         
         except Exception as e:
-            print(f"Error in task setup: {e}")
+            print(f"Critical Task Error: {e}")
+            # Sends error to your Log Channel (if configured)
+            await send_log(f"❌ **Task Crashed**\nUser: `{acc_user_id}`\nError: `{e}`")
+
         finally:
-            if task_uuid in ACTIVE_PROCESSES.get(user_id, {}):
-                try:
-                    del ACTIVE_PROCESSES[user_id][task_uuid]
-                except:
-                    pass
-            if user_id in ACTIVE_PROCESSES and not ACTIVE_PROCESSES[user_id]:
-                try: del ACTIVE_PROCESSES[user_id]
+            # 1. Cleanup Active Process List
+            if task_uuid in ACTIVE_PROCESSES.get(acc_user_id, {}):
+                try: del ACTIVE_PROCESSES[acc_user_id][task_uuid]
+                except: pass
+            if acc_user_id in ACTIVE_PROCESSES and not ACTIVE_PROCESSES[acc_user_id]:
+                try: del ACTIVE_PROCESSES[acc_user_id]
                 except: pass
 
-            batch_temp.ACTIVE_TASKS[user_id] -= 1
-            if batch_temp.ACTIVE_TASKS[user_id] < 0:
-                batch_temp.ACTIVE_TASKS[user_id] = 0
-            if batch_temp.ACTIVE_TASKS[user_id] == 0:
-                batch_temp.IS_BATCH[user_id] = False
+            # 2. Decrement Counter
+            batch_temp.ACTIVE_TASKS[acc_user_id] -= 1
+            if batch_temp.ACTIVE_TASKS[acc_user_id] < 0:
+                batch_temp.ACTIVE_TASKS[acc_user_id] = 0
+            if batch_temp.ACTIVE_TASKS[acc_user_id] == 0:
+                batch_temp.IS_BATCH[acc_user_id] = False
+            
+            # 3. CHECK QUEUE (The Magic Part ✨)
+            # If the user has items in their queue, start the next one immediately.
+            if TASK_QUEUE[acc_user_id]:
+                next_item = TASK_QUEUE[acc_user_id].pop(0)
+                asyncio.create_task(start_task_final(
+                    next_item["client"],
+                    next_item["message"],
+                    next_item["data"],
+                    next_item["delay"],
+                    acc_user_id
+                ))
+                # Optional: Notify user
+                try:
+                    await next_item["message"].reply("🏃 **Queue Update:** Your next task is starting now!", quote=True)
+                except: pass
 
+            # 4. Standard Session Cleanup
             if LOGIN_SYSTEM == True and acc:
                 try:
                     if acc.is_connected: await acc.stop()
-                except:
-                    pass
+                except: pass
 
+            # 5. Send Completion Message
             if 'was_cancelled' in locals() and was_cancelled:
                 try:
                     await client.send_message(
@@ -1395,7 +1602,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
             if 'status_message' in locals() and status_message:
                 try: await status_message.delete()
                 except: pass
-
+                
 # ==============================================================================
 # --- handle_private: downloads & uploads with per-task cancel checks ---
 # ==============================================================================
@@ -1645,6 +1852,316 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
         gc.collect()
 
 # ==============================================================================
+# --- NEW UNIVERSAL DOWNLOADER LOGIC (Aria2 / Mega / YT-DLP) ---
+# ==============================================================================
+
+async def handle_mega_link(client, message, link):
+    msg = await message.reply("🔎 **Processing Mega Link...**")
+    user_id = message.from_user.id
+
+    try:
+        if "folder/" in link or "#F!" in link:
+            # Folder Logic
+            EXTERNAL_QUEUE[user_id] = {"link": link, "type": "mega", "mode": "all"}
+            buttons = [[InlineKeyboardButton("📥 Download Folder", callback_data="mega_act:all")]]
+            await msg.edit(f"📂 **Mega Folder Detected**", reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            # File Logic
+            EXTERNAL_QUEUE[user_id] = {"link": link, "type": "mega", "mode": "file"}
+            buttons = [[InlineKeyboardButton("⬇️ Download File", callback_data="mega_act:file")]]
+            await msg.edit("📄 **Mega File Detected**", reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        await msg.edit(f"❌ Error: {e}")
+
+@app.on_callback_query(filters.regex("^mega_act:"))
+async def mega_callback(client, query):
+    action = query.data.split(":")[1]
+    user_id = query.from_user.id
+    if user_id not in EXTERNAL_QUEUE: return await query.answer("Expired.")
+    
+    data = EXTERNAL_QUEUE[user_id]
+    
+    # Setup Task Data
+    task_data = {
+        "link": data['link'],
+        "type": "mega",
+        "mode": action
+    }
+    # Trigger Start Task (Ask for speed? No, default to 3s for external)
+    await query.message.edit("⏳ **Added to Queue...**")
+    asyncio.create_task(start_task_final(client, query.message, task_data, delay=3, user_id=user_id))
+
+
+async def handle_torrent_link(client, message, link):
+    msg = await message.reply("🧲 **Fetching Magnet Metadata...**")
+    user_id = message.from_user.id
+    
+    try:
+        if not aria2: return await msg.edit("❌ Aria2 not configured.")
+        
+        # Add paused to check files
+        gid = aria2.add_magnet(link, options={'pause': 'true'})
+        download = aria2.get_download(gid)
+        
+        # Unpause briefly to fetch metadata
+        if not download.files:
+            aria2.unpause(gid)
+            for _ in range(30):
+                await asyncio.sleep(1)
+                download = aria2.get_download(gid)
+                if download.files and len(download.files) > 0 and download.files[0].path:
+                    aria2.pause(gid)
+                    break
+        
+        if not download.files:
+            aria2.remove([download])
+            return await msg.edit("❌ **Dead Torrent** (No metadata).")
+
+        EXTERNAL_QUEUE[user_id] = {"gid": gid, "type": "torrent"}
+        
+        buttons = []
+        # Show top 5 files
+        sorted_files = sorted(download.files, key=lambda x: x.length, reverse=True)[:5]
+        for f in sorted_files:
+            fname = Path(f.path).name
+            if len(fname) > 30: fname = fname[:27] + "..."
+            size = _pretty_bytes(f.length)
+            buttons.append([InlineKeyboardButton(f"📄 {fname} ({size})", callback_data=f"tor_sel:{f.index}")])
+            
+        buttons.append([InlineKeyboardButton("📥 Download All", callback_data="tor_sel:all")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="tor_sel:cancel")])
+
+        await msg.edit(f"🧲 **Files Found:**\nSelect what to download:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    except Exception as e:
+        await msg.edit(f"❌ Error: {e}")
+
+@app.on_callback_query(filters.regex("^tor_sel:"))
+async def torrent_callback(client, query):
+    choice = query.data.split(":")[1]
+    user_id = query.from_user.id
+    if user_id not in EXTERNAL_QUEUE: return await query.answer("Expired.")
+    
+    gid = EXTERNAL_QUEUE[user_id]['gid']
+    if choice == "cancel":
+        aria2.remove([gid])
+        await query.message.delete()
+        return
+
+    # Create task data
+    task_data = {
+        "link": "magnet...", # Placeholder
+        "gid": gid,
+        "type": "torrent",
+        "selection": choice
+    }
+    await query.message.edit("⏳ **Torrent Queued...**")
+    asyncio.create_task(start_task_final(client, query.message, task_data, delay=3, user_id=user_id))
+
+
+async def handle_general_link(client, message, link):
+    msg = await message.reply("🔎 **Analyzing Link...**")
+    user_id = message.from_user.id
+    
+    cookie_path = await db.get_cookies()
+    opts = {'cookiefile': cookie_path, 'quiet': True, 'extract_flat': True} if cookie_path else {'quiet': True}
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(link, download=False)
+            
+            # PLAYLIST / DRIVE FOLDER
+            if 'entries' in info:
+                count = len(info['entries'])
+                title = info.get('title', 'Collection')
+                EXTERNAL_QUEUE[user_id] = {"link": link, "type": "playlist"}
+                buttons = [[InlineKeyboardButton("📥 Download All", callback_data="pl_act:all")]]
+                await msg.edit(f"📂 **Collection:** `{title}`\nItems: {count}", reply_markup=InlineKeyboardMarkup(buttons))
+            
+            # VIDEO
+            elif 'formats' in info:
+                EXTERNAL_QUEUE[user_id] = {"link": link, "type": "video"}
+                buttons = [
+                    [InlineKeyboardButton("🎥 Best Video", callback_data="ext_q:best")],
+                    [InlineKeyboardButton("🎵 Audio Only", callback_data="ext_q:audio")],
+                    [InlineKeyboardButton("📂 Direct File", callback_data="ext_q:direct")]
+                ]
+                await msg.edit(f"🎬 **Video:** `{info.get('title')}`", reply_markup=InlineKeyboardMarkup(buttons))
+            
+            # GENERIC FILE
+            else:
+                EXTERNAL_QUEUE[user_id] = {"link": link, "type": "file"}
+                buttons = [
+                    [InlineKeyboardButton("📦 Zip", callback_data="ext_zip:yes")],
+                    [InlineKeyboardButton("📁 No Zip", callback_data="ext_zip:no")]
+                ]
+                await msg.edit("🔗 **File Link.** Zip before upload?", reply_markup=InlineKeyboardMarkup(buttons))
+
+    except Exception as e:
+        # Fallback to generic
+        EXTERNAL_QUEUE[user_id] = {"link": link, "type": "file"}
+        buttons = [[InlineKeyboardButton("📁 Upload", callback_data="ext_zip:no")]]
+        await msg.edit("⚠️ **Unknown Link Type.** Uploading as file.", reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex("^ext_q:"))
+async def quality_cb(c, q):
+    uid = q.from_user.id
+    if uid not in EXTERNAL_QUEUE: return await q.answer("Expired")
+    EXTERNAL_QUEUE[uid]['quality'] = q.data.split(":")[1]
+    # Ask Zip
+    buttons = [[InlineKeyboardButton("📦 Zip", callback_data="ext_zip:yes"), InlineKeyboardButton("📁 No Zip", callback_data="ext_zip:no")]]
+    await q.message.edit("⚙️ **Zip Preference?**", reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex("^pl_act:"))
+async def playlist_cb(c, q):
+    uid = q.from_user.id
+    if uid not in EXTERNAL_QUEUE: return await q.answer("Expired")
+    data = EXTERNAL_QUEUE[uid]
+    task_data = {"link": data['link'], "type": "playlist_all", "zip": False}
+    await q.message.edit("⏳ **Playlist Queued...**")
+    asyncio.create_task(start_task_final(c, q.message, task_data, delay=3, user_id=uid))
+
+@app.on_callback_query(filters.regex("^ext_zip:"))
+async def zip_cb(c, q):
+    uid = q.from_user.id
+    if uid not in EXTERNAL_QUEUE: return await q.answer("Expired")
+    should_zip = (q.data.split(":")[1] == "yes")
+    data = EXTERNAL_QUEUE[uid]
+    
+    task_data = {
+        "link": data['link'],
+        "type": "external",
+        "quality": data.get('quality', 'direct'),
+        "zip": should_zip
+    }
+    await q.message.edit("⏳ **Task Queued...**")
+    asyncio.create_task(start_task_final(c, q.message, task_data, delay=3, user_id=uid))
+
+# --- THE DOWNLOADER ENGINE ---
+async def process_external_logic(client, message, task_data, delay, user_id, task_uuid):
+    status_msg = message
+    try:
+        if isinstance(message, Message):
+             await status_msg.edit("🚀 **Starting Downloader Engine...**")
+    except: pass
+
+    # Setup Paths
+    down_path = Path(f"./downloads/{user_id}/{task_uuid}/")
+    down_path.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        link = task_data.get('link')
+        ttype = task_data.get('type')
+        
+        # 1. TORRENT HANDLING
+        if ttype == 'torrent':
+            gid = task_data['gid']
+            sel = task_data['selection']
+            if sel != 'all': aria2.change_option(gid, {"select-file": sel})
+            aria2.unpause(gid)
+            
+            while True:
+                await asyncio.sleep(5)
+                dl = aria2.get_download(gid)
+                if dl.status == 'complete': break
+                if dl.status == 'error': raise Exception("Torrent Error")
+                try: await status_msg.edit(f"⬇️ **Downloading Torrent...**\n{dl.progress_string()}")
+                except: pass
+                
+            # Move files to down_path for processing
+            for f in dl.files:
+                if os.path.exists(f.path):
+                    shutil.move(f.path, str(down_path / Path(f.path).name))
+            aria2.remove([dl])
+
+        # 2. MEGA HANDLING
+        elif ttype == 'mega':
+            await status_msg.edit("⬇️ **Downloading from Mega...**")
+            mode = task_data.get('mode')
+            if mode == 'all':
+                # Folder: Mega.py doesn't support folder download easily. 
+                # We iterate and queue files (Simplified for robustness)
+                await status_msg.edit("⚠️ Mega Folder: Downloading files sequentially...")
+                m_login.download_url(link, str(down_path))
+            else:
+                m_login.download_url(link, str(down_path))
+
+        # 3. HTTP / YOUTUBE / DRIVE
+        else:
+            qual = task_data.get('quality', 'best')
+            cookie_path = await db.get_cookies()
+            
+            ydl_opts = {
+                'outtmpl': str(down_path / '%(title)s.%(ext)s'),
+                'quiet': True,
+                'cookiefile': cookie_path,
+                'external_downloader': 'aria2c',
+                'external_downloader_args': ['-x', '16', '-k', '1M']
+            }
+            
+            if ttype == 'playlist_all': ydl_opts['yes_playlist'] = True
+            else: ydl_opts['noplaylist'] = True
+
+            if qual == 'audio': ydl_opts['format'] = 'bestaudio/best'
+            elif qual != 'direct': ydl_opts['format'] = f"bestvideo[height<={qual}]+bestaudio/best"
+
+            await status_msg.edit("⬇️ **Downloading (Aria2/Yt-dlp)...**")
+            
+            def run_dl():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([link])
+            await asyncio.to_thread(run_dl)
+
+        # 4. PROCESSING & UPLOAD
+        files = [x for x in down_path.iterdir() if x.is_file()]
+        if not files: raise Exception("No files found after download.")
+        
+        # ZIP Logic
+        if task_data.get('zip'):
+            await status_msg.edit("📦 **Zipping...**")
+            zip_name = down_path / f"{files[0].stem}.zip"
+            # Simple zip all
+            subprocess.run(f"zip -r -0 '{zip_name}' ./*", shell=True, cwd=str(down_path))
+            # Delete others
+            for f in files: os.remove(f)
+            files = [zip_name]
+
+        # Upload Loop
+        for i, file_path in enumerate(files):
+            caption = f"`{file_path.name}`"
+            fsize = os.path.getsize(file_path)
+            
+            if fsize > 2000 * 1024 * 1024:
+                await status_msg.edit(f"🔪 **Splitting {file_path.name}...**")
+                parts = await split_file_python(file_path)
+                for part in parts:
+                     await client.send_document(message.chat.id, part, caption=caption, force_document=True)
+                     os.remove(part)
+            else:
+                await status_msg.edit(f"📤 **Uploading {file_path.name}...**")
+                await client.send_document(message.chat.id, file_path, caption=caption, force_document=True)
+        
+        await status_msg.edit("✅ **Task Completed!**")
+
+    except Exception as e:
+        await status_msg.edit(f"❌ **Error:** `{e}`")
+        print(f"External Error: {e}")
+    finally:
+        shutil.rmtree(down_path, ignore_errors=True)
+        # Cleanup Active Process
+        if task_uuid in ACTIVE_PROCESSES.get(user_id, {}):
+             del ACTIVE_PROCESSES[user_id][task_uuid]
+        batch_temp.ACTIVE_TASKS[user_id] -= 1
+        
+        # Check Queue
+        if TASK_QUEUE[user_id]:
+            next_item = TASK_QUEUE[user_id].pop(0)
+            asyncio.create_task(start_task_final(
+                next_item["client"], next_item["message"], 
+                next_item["data"], next_item["delay"], user_id
+            ))
+
+# ==============================================================================
 # --- Koyeb health check (optional) ---
 # ==============================================================================
 try:
@@ -1683,11 +2200,14 @@ async def main():
             print("✅ Cleanup: Deleted old downloads folder.")
         except Exception as e:
             print(f"⚠️ Cleanup Error: {e}")
+            
+    # START THE WATCHDOG HERE
+    asyncio.create_task(cleanup_watchdog())
+    print("🛡️ Auto-Cleanup Watchdog Started")
+
     await app.start()
     print("Bot Started")
     asyncio.create_task(start_koyeb_health_check())
     await idle()
     await app.stop()
-
-if __name__ == "__main__":
-    app.run(main())
+    
