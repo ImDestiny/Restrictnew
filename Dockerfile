@@ -17,4 +17,4 @@ RUN pip3 install -r requirements.txt
 COPY . .
 
 # Ensure Aria2 runs in the background (Daemon mode) before starting the bot
-CMD aria2c --enable-rpc --rpc-listen-all=false --daemon && python3 restrict_bot.py
+CMD sh -c "aria2c --enable-rpc --rpc-listen-all=false --daemon && python3 restrict_bot.py"
