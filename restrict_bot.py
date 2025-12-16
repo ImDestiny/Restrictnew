@@ -300,21 +300,17 @@ async def downstatus(client: Client, status_message: Message, chat, index: int, 
             continue
         if rec["current"] == rec["total"] and rec["total"] > 0:
             break
-        percent = rec.get("percent", 0.0)
-        cur = rec.get("current", 0)
-        tot = rec.get("total", 0)
-        speed = rec.get("speed", 0.0)
-        eta = rec.get("eta")
-        bar = generate_bar(percent, length=12) # Slightly longer bar
+            
+        # ... (keep all the calculation code here: percent, speed, bar, etc.) ...
         
         # --- NEW STYLE ---
         status = (
             f"📥 **Downloading File ({index}/{total_count})**\n"
             f"└ 📂 `{max(0, total_count-index)}` remaining\n\n"
-            f"**{percent:.1f}%** │ `{bar}`\n\n"
-            f"🚀 **Speed:** `{_pretty_bytes(speed)}/s`\n"
-            f"💾 **Size:** `{_pretty_bytes(cur)} / {_pretty_bytes(tot)}`\n"
-            f"⏳ **ETA:** `{get_readable_time(int(eta) if eta else 0)}`"
+            f"**{rec.get('percent', 0):.1f}%** │ `{generate_bar(rec.get('percent', 0), length=12)}`\n\n"
+            f"🚀 **Speed:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
+            f"💾 **Size:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
+            f"⏳ **ETA:** `{get_readable_time(int(rec.get('eta', 0)) if rec.get('eta') else 0)}`"
         )
         # -----------------
 
@@ -324,12 +320,15 @@ async def downstatus(client: Client, status_message: Message, chat, index: int, 
                 last_text = status
             except:
                 pass
-        await asyncio.sleep(10) # 10s is smoother than 15s
+        
+        # FIX: Changed from 10 to 20 seconds
+        await asyncio.sleep(20) 
+        
     try:
         await client.edit_message_text(chat, msg_id, f"✅ **Download Complete** ({index}/{total_count})\n⚡ **Processing file...**")
     except:
         pass
-
+        
 async def upstatus(client: Client, status_message: Message, chat, index: int, total_count: int):
     msg_id = status_message.id
     key = f"{msg_id}:up"
@@ -341,21 +340,17 @@ async def upstatus(client: Client, status_message: Message, chat, index: int, to
             continue
         if rec["current"] == rec["total"] and rec["total"] > 0:
             break
-        percent = rec.get("percent", 0.0)
-        cur = rec.get("current", 0)
-        tot = rec.get("total", 0)
-        speed = rec.get("speed", 0.0)
-        eta = rec.get("eta")
-        bar = generate_bar(percent, length=12)
+            
+        # ... (keep all the calculation code here) ...
 
         # --- NEW STYLE ---
         status = (
             f"☁️ **Uploading File ({index}/{total_count})**\n"
             f"└ 📤 `{max(0, total_count-index)}` remaining\n\n"
-            f"**{percent:.1f}%** │ `{bar}`\n\n"
-            f"🚀 **Speed:** `{_pretty_bytes(speed)}/s`\n"
-            f"💾 **Size:** `{_pretty_bytes(cur)} / {_pretty_bytes(tot)}`\n"
-            f"⏳ **ETA:** `{get_readable_time(int(eta) if eta else 0)}`"
+            f"**{rec.get('percent', 0):.1f}%** │ `{generate_bar(rec.get('percent', 0), length=12)}`\n\n"
+            f"🚀 **Speed:** `{_pretty_bytes(rec.get('speed', 0))}/s`\n"
+            f"💾 **Size:** `{_pretty_bytes(rec.get('current', 0))} / {_pretty_bytes(rec.get('total', 0))}`\n"
+            f"⏳ **ETA:** `{get_readable_time(int(rec.get('eta', 0)) if rec.get('eta') else 0)}`"
         )
         # -----------------
 
@@ -365,7 +360,10 @@ async def upstatus(client: Client, status_message: Message, chat, index: int, to
                 last_text = status
             except:
                 pass
-        await asyncio.sleep(10)
+        
+        # FIX: Changed from 10 to 20 seconds
+        await asyncio.sleep(20)
+
     try:
         await client.edit_message_text(chat, msg_id, f"✅ **Upload Complete** ({index}/{total_count})")
     except:
