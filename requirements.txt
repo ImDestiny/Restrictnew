@@ -4,3 +4,6 @@ motor
 aiohttp
 psutil
 dnspython
+yt-dlp
+aria2p
+mega.py
