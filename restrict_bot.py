@@ -147,8 +147,8 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=50,
-    sleep_threshold=5
+    workers=10,
+    sleep_threshold=20
 )
 
 BOT_START_TIME = time.time()
@@ -745,8 +745,13 @@ async def login_handler(bot: Client, message: Message):
 async def broadcast_messages(user_id, message):
     try:
         await message.copy(chat_id=user_id)
+        # FIX: Sleep prevents "Broadcasting Flood"
+        await asyncio.sleep(1.5) 
         return True, "Success"
     except FloodWait as e:
+        # If floodwait is huge, just skip this user to save the broadcast
+        if e.value > 60:
+            return False, "Error"
         await asyncio.sleep(e.value)
         return await broadcast_messages(user_id, message)
     except InputUserDeactivated:
@@ -965,7 +970,13 @@ async def process_speed_input(client: Client, message: Message):
         pass
     if not text.isdigit():
         return await message.reply("❌ Please send a valid number (0, 1, 2...).")
+    
+    # FIX: Enforce minimum safety delay. "0" is dangerous.
     delay = int(text)
+    if delay < 3: 
+        delay = 3
+        await message.reply("⚠️ **Note:** To prevent FloodWait bans, minimum speed has been set to 3 seconds.")
+        
     if user_id in PENDING_TASKS:
         task_data = PENDING_TASKS[user_id]
         del PENDING_TASKS[user_id]
@@ -1258,23 +1269,46 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                                 current_topic = msg.message_thread_id
                                 if current_topic != filter_thread_id:
                                     needs_retry = False
-                                    await asyncio.sleep(6)
-                                    break
+                                    break # Skip this msg without waiting 6s
+                            
+                            # --- ROBUST LOGIC START ---
                             if "https://t.me/c/" in text:
                                 is_success = await handle_private(client, acc, message, chatid, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id, task_uuid)
                             else:
                                 try:
                                     await client.copy_message(dest_chat_id, msg.chat.id, msg.id, message_thread_id=dest_thread_id)
                                     is_success = True
-                                    await asyncio.sleep(delay)
                                 except:
+                                    # Fallback to download/upload if copy fails
                                     is_success = await handle_private(client, acc, message, chatid, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id, task_uuid)
+                            # --- ROBUST LOGIC END ---
+
                         else:
-                            await asyncio.sleep(6)
+                            # Message deleted or empty
+                            is_success = False
+
+                        # FIX: UNIVERSAL SLEEP (Applies to ALL success types - Copy, DL, or Text)
+                        if is_success:
+                            await asyncio.sleep(delay) # Minimum 3s delay
+                        else:
+                            await asyncio.sleep(2) # Small penalty for failures
 
                         needs_retry = False
+
                     except FloodWait as e:
-                        await asyncio.sleep(e.value + 6)
+                        print(f"FloodWait encountered: {e.value} s")
+                        # FIX: ABORT IF FLOODWAIT IS DANGEROUS (> 2 MINUTES)
+                        if e.value > 120:
+                            try:
+                                await client.send_message(
+                                    message.chat.id, 
+                                    f"🚨 **Task Aborted:** Telegram demanded a wait of {e.value}s (FloodWait).\nTo protect your account, this task has been stopped."
+                                )
+                            except: pass
+                            return # Stop the function entirely
+                        
+                        await asyncio.sleep(e.value + 5)
+                    
                     except Exception as loop_e:
                         print(f"Loop Error: {loop_e}")
                         is_success = False
@@ -1285,8 +1319,10 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 else:
                     failed_count += 1
 
+                # FIX: OPTIMIZED STATUS UPDATES (Reduces API spam)
                 current_time = time.time()
-                if (current_time - last_update_time) > 60:
+                # Update only every 20 messages OR if 60 seconds passed
+                if (index % 20 == 0) or ((current_time - last_update_time) > 60):
                     last_update_time = current_time
                     elapsed_time = current_time - start_time
                     if elapsed_time > 0:
@@ -1307,7 +1343,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                         )
                     except Exception as e:
                         print(f"Error updating status: {e}")
-
+                        
         except Exception as e:
             print(f"Error in task setup: {e}")
         finally:
@@ -1548,11 +1584,16 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             # Note: If uploader is 'acc', it sends to dest_chat_id as the User.
             # If dest_chat_id is the Bot's DM, the file will appear in "Saved Messages" of the User.
 
+        # --- FIX: RETRY LOGIC FOR UPLOADS ---
+        upload_attempts = 0
+        max_retries = 1
+
         async with USER_UPLOAD_LOCKS[user_id]:
             async with UPLOAD_SEMAPHORE:
                 while True:
                     if batch_temp.IS_BATCH.get(user_id) or (task_uuid and CANCEL_FLAGS.get(task_uuid)):
                         break
+                        
                     try:
                         if "Document" == msg_type:
                             await uploader.send_document(dest_chat_id, file_path, thumb=ph_path, caption=caption, message_thread_id=dest_thread_id, progress=progress, progress_args=[status_message,"up", task_uuid])
@@ -1568,19 +1609,30 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
                             await uploader.send_animation(dest_chat_id, file_path, caption=caption, message_thread_id=dest_thread_id)
                         elif "Sticker" == msg_type:
                             await uploader.send_sticker(dest_chat_id, file_path, message_thread_id=dest_thread_id)
+                        
                         upload_success = True
-                        break
+                        break # Success! Exit loop.
+
                     except Exception as e:
                         if "CANCELLED_BY_USER" in str(e):
                             upload_success = False
                             break
+                        
                         if isinstance(e, FloodWait):
+                            # FloodWait isn't a "failure", it's a pause. Don't increment retries.
+                            print(f"FloodWait: Sleeping {e.value}s...")
                             await asyncio.sleep(e.value)
                         else:
-                            print(f"Upload failed: {e}")
-                            upload_success = False
-                            break
-        
+                            # Genuine Error (Network, Timeout, etc.)
+                            upload_attempts += 1
+                            if upload_attempts < max_retries:
+                                print(f"Upload Error (Attempt {upload_attempts}/{max_retries}): {e}. Retrying in 5s...")
+                                await asyncio.sleep(5) # Wait 5s before retrying
+                            else:
+                                print(f"Upload Failed Permanently after {max_retries} attempts: {e}")
+                                upload_success = False
+                                break
+                                     
         return upload_success
 
     finally:
