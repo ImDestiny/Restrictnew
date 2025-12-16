@@ -2049,54 +2049,92 @@ async def process_external_logic(client, message, task_data, delay, user_id, tas
     down_path = Path(f"./downloads/{user_id}/{task_uuid}/")
     down_path.mkdir(parents=True, exist_ok=True)
     
+    aria2_gid = None
+
     try:
         link = task_data.get('link')
         ttype = task_data.get('type')
         
-        # 1. TORRENT HANDLING
+        # --- 1. TORRENT HANDLING ---
         if ttype == 'torrent':
             gid = task_data['gid']
+            aria2_gid = gid
             sel = task_data['selection']
             if sel != 'all': aria2.change_option(gid, {"select-file": sel})
             aria2.unpause(gid)
             
+            last_edit = 0
             while True:
-                await asyncio.sleep(5)
-                dl = aria2.get_download(gid)
-                if dl.status == 'complete': break
-                if dl.status == 'error': raise Exception("Torrent Error")
-                try: await status_msg.edit(f"⬇️ **Downloading Torrent...**\n{dl.progress_string()}")
-                except: pass
+                # CANCEL CHECK
+                if CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED_BY_USER")
                 
-            # Move files to down_path for processing
+                await asyncio.sleep(4)
+                dl = aria2.get_download(gid)
+                
+                if dl.status == 'complete': break
+                if dl.status == 'error': raise Exception("Torrent Error: Dead link or Tracker fail")
+                
+                # --- NEW PROGRESS BAR STYLE (Aria2) ---
+                now = time.time()
+                if (now - last_edit) > 10: # Update every 10s
+                    last_edit = now
+                    try:
+                        perc = dl.progress # string "12.5"
+                        try: fperc = float(perc)
+                        except: fperc = 0.0
+                        
+                        speed_str = _pretty_bytes(dl.download_speed)
+                        done_str = _pretty_bytes(dl.completed_length)
+                        total_str = _pretty_bytes(dl.total_length)
+                        eta_str = str(dl.eta) if dl.eta else "0s"
+                        
+                        msg_text = (
+                            f"📥 **Downloading Torrent**\n"
+                            f"**{fperc:.1f}%** │ `{generate_bar(fperc, length=12)}`\n\n"
+                            f"🚀 **Speed:** `{speed_str}/s`\n"
+                            f"💾 **Size:** `{done_str} / {total_str}`\n"
+                            f"⏳ **ETA:** `{eta_str}`"
+                        )
+                        await status_msg.edit(msg_text)
+                    except: pass
+                
+            # Move files
             for f in dl.files:
                 if os.path.exists(f.path):
                     shutil.move(f.path, str(down_path / Path(f.path).name))
             aria2.remove([dl])
 
-        # 2. MEGA HANDLING
+        # --- 2. MEGA HANDLING ---
         elif ttype == 'mega':
-            await status_msg.edit("⬇️ **Downloading from Mega...**")
+            if CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED_BY_USER")
+            await status_msg.edit("⬇️ **Downloading from Mega...**\n(Mega API doesn't support progress bars yet)")
+            
             mode = task_data.get('mode')
-            if mode == 'all':
-                # Folder: Mega.py doesn't support folder download easily. 
-                # We iterate and queue files (Simplified for robustness)
-                await status_msg.edit("⚠️ Mega Folder: Downloading files sequentially...")
-                m_login.download_url(link, str(down_path))
-            else:
-                m_login.download_url(link, str(down_path))
+            try:
+                if mode == 'all':
+                    m_login.download_url(link, str(down_path))
+                else:
+                    m_login.download_url(link, str(down_path))
+            except Exception as e:
+                raise Exception(f"Mega Error: {e}")
 
-        # 3. HTTP / YOUTUBE / DRIVE
+        # --- 3. HTTP / YOUTUBE / DRIVE ---
         else:
+            if CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED_BY_USER")
+            
             qual = task_data.get('quality', 'best')
             cookie_path = await db.get_cookies()
             
+            # TIMEOUT FIX IS HERE (socket_timeout)
             ydl_opts = {
                 'outtmpl': str(down_path / '%(title)s.%(ext)s'),
                 'quiet': True,
                 'cookiefile': cookie_path,
                 'external_downloader': 'aria2c',
-                'external_downloader_args': ['-x', '16', '-k', '1M']
+                'external_downloader_args': ['-x', '16', '-k', '1M'],
+                'socket_timeout': 60, # Fix for Read Timed Out
+                'retries': 10,
+                'ignoreerrors': True
             }
             
             if ttype == 'playlist_all': ydl_opts['yes_playlist'] = True
@@ -2112,40 +2150,73 @@ async def process_external_logic(client, message, task_data, delay, user_id, tas
                     ydl.download([link])
             await asyncio.to_thread(run_dl)
 
-        # 4. PROCESSING & UPLOAD
+        # --- 4. PROCESSING & UPLOAD ---
+        if CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED_BY_USER")
+
         files = [x for x in down_path.iterdir() if x.is_file()]
-        if not files: raise Exception("No files found after download.")
+        if not files: raise Exception("Download failed (No files found). Check link.")
         
         # ZIP Logic
         if task_data.get('zip'):
             await status_msg.edit("📦 **Zipping...**")
             zip_name = down_path / f"{files[0].stem}.zip"
-            # Simple zip all
+            if CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED_BY_USER")
             subprocess.run(f"zip -r -0 '{zip_name}' ./*", shell=True, cwd=str(down_path))
-            # Delete others
             for f in files: os.remove(f)
             files = [zip_name]
 
         # Upload Loop
-        for i, file_path in enumerate(files):
+        total_files = len(files)
+        
+        # Start Upload Status Background Task
+        # This makes the progress bar work for uploads!
+        asyncio.create_task(upstatus(client, status_msg, message.chat.id, 0, total_files))
+
+        for i, file_path in enumerate(files, start=1):
+            if CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED_BY_USER")
+            
             caption = f"`{file_path.name}`"
             fsize = os.path.getsize(file_path)
             
             if fsize > 2000 * 1024 * 1024:
-                await status_msg.edit(f"🔪 **Splitting {file_path.name}...**")
+                # SPLIT
                 parts = await split_file_python(file_path)
                 for part in parts:
-                     await client.send_document(message.chat.id, part, caption=caption, force_document=True)
-                     os.remove(part)
+                    if CANCEL_FLAGS.get(task_uuid): raise Exception("CANCELLED_BY_USER")
+                    
+                    # Use existing progress callback
+                    await client.send_document(
+                        message.chat.id, part, caption=caption, force_document=True,
+                        progress=progress, progress_args=[status_msg, "up", task_uuid]
+                    )
+                    os.remove(part)
+                    # Small sleep to allow cancel check to hit
+                    await asyncio.sleep(1)
             else:
-                await status_msg.edit(f"📤 **Uploading {file_path.name}...**")
-                await client.send_document(message.chat.id, file_path, caption=caption, force_document=True)
+                # NORMAL
+                await client.send_document(
+                    message.chat.id, file_path, caption=caption, force_document=True,
+                    progress=progress, progress_args=[status_msg, "up", task_uuid]
+                )
+            
+            # Clean up uploaded file
+            try: os.remove(file_path)
+            except: pass
         
         await status_msg.edit("✅ **Task Completed!**")
 
     except Exception as e:
-        await status_msg.edit(f"❌ **Error:** `{e}`")
-        print(f"External Error: {e}")
+        err_str = str(e)
+        if "CANCELLED" in err_str:
+            await status_msg.edit("🛑 **Task Cancelled by User.**")
+            # Ensure Aria2 download is killed if it was running
+            if aria2_gid:
+                try: aria2.remove([aria2_gid])
+                except: pass
+        else:
+            await status_msg.edit(f"❌ **Error:** `{err_str[:500]}`")
+            print(f"External Error: {e}")
+            
     finally:
         shutil.rmtree(down_path, ignore_errors=True)
         # Cleanup Active Process
@@ -2160,6 +2231,7 @@ async def process_external_logic(client, message, task_data, delay, user_id, tas
                 next_item["client"], next_item["message"], 
                 next_item["data"], next_item["delay"], user_id
             ))
+            
 
 # ==============================================================================
 # --- Koyeb health check (optional) ---
