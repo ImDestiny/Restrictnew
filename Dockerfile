@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     aria2 \
     ffmpeg \
     zip \
+    unzip \
+    p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements.txt
