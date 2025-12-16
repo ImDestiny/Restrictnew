@@ -4,13 +4,16 @@ WORKDIR /app
 # Forces Python to print logs immediately
 ENV PYTHONUNBUFFERED=1
 
-# --- NEW: Install System Dependencies (Aria2, FFmpeg, Zip) ---
+# --- NEW: Install System Dependencies (Aria2, FFmpeg, Zip, AND NODEJS) ---
+# Added 'nodejs' and 'npm' to the list below
 RUN apt-get update && apt-get install -y \
     aria2 \
     ffmpeg \
     zip \
     unzip \
     p7zip-full \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements.txt
