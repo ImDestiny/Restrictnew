@@ -2194,9 +2194,10 @@ async def start_koyeb_health_check(host: str = "0.0.0.0", port: int | str = 8080
 # ==============================================================================
 
 async def main():
-    # 1. Start Health Check FIRST (So Koyeb stays happy)
+    # 1. Start Health Check FIRST (Critical for Koyeb)
+    # We start this immediately so Koyeb sees Port 8080 is open
     asyncio.create_task(start_koyeb_health_check())
-
+    
     # 2. Cleanup Old Files
     if os.path.exists("./downloads"):
         try:
@@ -2209,18 +2210,22 @@ async def main():
     asyncio.create_task(cleanup_watchdog())
     print("🛡️ Auto-Cleanup Watchdog Started")
 
-    # 4. Connect to Telegram
+    # 4. Connect to Telegram (This takes a few seconds, but Health Check is already running!)
     print("Connecting to Telegram...")
     await app.start()
     print("Bot Started")
     
     await idle()
     await app.stop()
-    
+                  
 # ==============================================================================
 # --- BOT STARTUP (CRITICAL FIX) ---
 # ==============================================================================
 
 if __name__ == "__main__":
     print("🤖 Bot is starting...")
-    app.run()
+    # We must run the main() function, NOT app.run()
+    # main() handles the Health Check + Bot connection logic
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+    
