@@ -1,4 +1,4 @@
-FROM python:3.10.8-slim-buster
+FROM python:3.10-slim-bookworm
 WORKDIR /app
 
 # Forces Python to print logs immediately
@@ -17,5 +17,4 @@ RUN pip3 install -r requirements.txt
 COPY . .
 
 # Ensure Aria2 runs in the background (Daemon mode) before starting the bot
-# We use a shell command to start aria2c first, then python
 CMD aria2c --enable-rpc --rpc-listen-all=false --daemon && python3 restrict_bot.py
