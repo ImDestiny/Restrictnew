@@ -1789,4 +1789,7 @@ async def main():
     asyncio.create_task(start_koyeb_health_check())
     await idle()
     await app.stop()
+
+if __name__ == "__main__":
+    app.run(main())
     
